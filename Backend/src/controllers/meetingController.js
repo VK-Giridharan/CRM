@@ -1,5 +1,17 @@
 const pool = require("../database/connection");
 
+const {
+    parseId,
+    parseDateOnly,
+    parseTimeOnly,
+    validateName,
+    validateText,
+    validateShortText,
+    validateDate,
+    validateTime,
+    firstError
+} = require("../utils/validation");
+
 exports.createMeeting = async (req, res) => {
 
     try {
@@ -29,6 +41,37 @@ exports.createMeeting = async (req, res) => {
             });
 
         }
+
+        const leadId = parseId(lead_id);
+
+        if (!leadId) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid Lead ID"
+            });
+        }
+
+        // Date and time are validated here so a value like "2026-13-45" or
+        // "99:99" returns a 400 instead of reaching Postgres and surfacing
+        // as a generic 500 (report BUG-008).
+        const validationError = firstError([
+            validateName(meeting_title, "Meeting title"),
+            validateDate(meeting_date, "Meeting date", { required: true }),
+            validateTime(meeting_time, "Meeting time", { required: true }),
+            validateShortText(meeting_type, "Meeting type"),
+            validateText(location, "Location"),
+            validateText(description, "Description")
+        ]);
+
+        if (validationError) {
+            return res.status(400).json({
+                success: false,
+                message: validationError
+            });
+        }
+
+        const meetingDate = parseDateOnly(meeting_date);
+        const meetingTime = parseTimeOnly(meeting_time);
 
         // ================= GET MANAGER =================
 
@@ -62,7 +105,7 @@ exports.createMeeting = async (req, res) => {
             AND company_id = $2
             `,
             [
-                lead_id,
+                leadId,
                 company_id
             ]
         );
@@ -114,12 +157,12 @@ exports.createMeeting = async (req, res) => {
             RETURNING *
             `,
             [
-                lead_id,
+                leadId,
                 company_id,
                 req.user.id,
                 meeting_title,
-                meeting_date,
-                meeting_time,
+                meetingDate,
+                meetingTime,
                 meeting_type,
                 location,
                 description,
@@ -140,7 +183,7 @@ exports.createMeeting = async (req, res) => {
             `,
             [
                 req.user.id,
-                lead_id
+                leadId
             ]
         );
 
@@ -286,6 +329,15 @@ exports.getMeetingDetails = async (req, res) => {
 
         }
 
+        const meetingId = parseId(meeting_id);
+
+        if (!meetingId) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid Meeting ID"
+            });
+        }
+
         // ================= GET MANAGER =================
 
         const manager = await pool.query(
@@ -338,7 +390,7 @@ exports.getMeetingDetails = async (req, res) => {
                 AND m.company_id = $2
             `,
             [
-                meeting_id,
+                meetingId,
                 company_id
             ]
         );
@@ -406,6 +458,34 @@ exports.updateMeeting = async (req, res) => {
 
         }
 
+        const meetingId = parseId(meeting_id);
+
+        if (!meetingId) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid Meeting ID"
+            });
+        }
+
+        const validationError = firstError([
+            validateName(meeting_title, "Meeting title"),
+            validateDate(meeting_date, "Meeting date", { required: true }),
+            validateTime(meeting_time, "Meeting time", { required: true }),
+            validateShortText(meeting_type, "Meeting type"),
+            validateText(location, "Location"),
+            validateText(description, "Description")
+        ]);
+
+        if (validationError) {
+            return res.status(400).json({
+                success: false,
+                message: validationError
+            });
+        }
+
+        const meetingDate = parseDateOnly(meeting_date);
+        const meetingTime = parseTimeOnly(meeting_time);
+
         // ================= GET MANAGER =================
 
         const manager = await pool.query(
@@ -438,7 +518,7 @@ exports.updateMeeting = async (req, res) => {
             AND company_id = $2
             `,
             [
-                meeting_id,
+                meetingId,
                 company_id
             ]
         );
@@ -466,31 +546,53 @@ exports.updateMeeting = async (req, res) => {
 
         // ================= UPDATE =================
 
+        // PARTIAL UPDATE (same class as NEW-BUG-001 / BUG-006 / BUG-012).
+        // meeting_type, location and description used to be overwritten with
+        // NULL whenever the caller omitted them.
+        const has = (key) =>
+            Object.prototype.hasOwnProperty.call(req.body, key);
+
+        const setClauses = [];
+        const values = [];
+
+        const push = (column, value) => {
+            values.push(value);
+            setClauses.push(`${column} = $${values.length}`);
+        };
+
+        // Required by the validation above, so always written.
+        push("meeting_title", meeting_title);
+        push("meeting_date", meetingDate);
+        push("meeting_time", meetingTime);
+
+        for (const [column, value] of Object.entries({
+            meeting_type,
+            location,
+            description
+        })) {
+
+            if (!has(column)) continue;
+
+            const isBlank =
+                value === null || value === undefined || String(value).trim() === "";
+
+            push(column, isBlank ? null : value);
+
+        }
+
+        push("updated_by", req.user.id);
+
+        values.push(meetingId);
+
         const result = await pool.query(
             `
             UPDATE meetings
-            SET
-                meeting_title = $1,
-                meeting_date = $2,
-                meeting_time = $3,
-                meeting_type = $4,
-                location = $5,
-                description = $6,
-                updated_by = $7,
+            SET ${setClauses.join(", ")},
                 updated_at = CURRENT_TIMESTAMP
-            WHERE id = $8
+            WHERE id = $${values.length}
             RETURNING *
             `,
-            [
-                meeting_title,
-                meeting_date,
-                meeting_time,
-                meeting_type,
-                location,
-                description,
-                req.user.id,
-                meeting_id
-            ]
+            values
         );
 
         return res.status(200).json({
@@ -529,6 +631,15 @@ exports.deleteMeeting = async (req, res) => {
 
         }
 
+        const meetingId = parseId(meeting_id);
+
+        if (!meetingId) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid Meeting ID"
+            });
+        }
+
         // ================= GET MANAGER =================
 
         const manager = await pool.query(
@@ -561,7 +672,7 @@ exports.deleteMeeting = async (req, res) => {
             AND company_id = $2
             `,
             [
-                meeting_id,
+                meetingId,
                 company_id
             ]
         );
@@ -591,7 +702,7 @@ exports.deleteMeeting = async (req, res) => {
             DELETE FROM meetings
             WHERE id = $1
             `,
-            [meeting_id]
+            [meetingId]
         );
 
         // ================= UPDATE LEAD STATUS =================
@@ -675,6 +786,19 @@ exports.completeMeeting = async (req, res) => {
 
         }
 
+        const meetingId = parseId(meeting_id);
+
+        if (!meetingId) {
+
+            await client.query("ROLLBACK");
+
+            return res.status(400).json({
+                success: false,
+                message: "Invalid Meeting ID"
+            });
+
+        }
+
         // ================= VALID RESULT =================
 
         const validResult = [
@@ -706,6 +830,21 @@ exports.completeMeeting = async (req, res) => {
             });
 
         }
+
+        const nextDateError = validateDate(next_meeting_date, "Next meeting date");
+
+        if (nextDateError) {
+
+            await client.query("ROLLBACK");
+
+            return res.status(400).json({
+                success: false,
+                message: nextDateError
+            });
+
+        }
+
+        const nextMeetingDate = parseDateOnly(next_meeting_date);
 
         // ================= GET MANAGER =================
 
@@ -739,7 +878,7 @@ exports.completeMeeting = async (req, res) => {
             AND company_id = $2
             `,
             [
-                meeting_id,
+                meetingId,
                 manager.rows[0].company_id
             ]
         );
@@ -783,9 +922,9 @@ exports.completeMeeting = async (req, res) => {
             `,
             [
                 meeting_result,
-                next_meeting_date || null,
+                nextMeetingDate,
                 req.user.id,
-                meeting_id
+                meetingId
             ]
         );
 

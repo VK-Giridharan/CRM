@@ -12,6 +12,7 @@ import {
 } from "../../services/taskReportService";
 
 import StatusBadge from "../common/StatusBadge";
+import { formatDate, formatDateTime } from "../../utils/formatDate";
 
 // ======================================================
 // WORKER TASK WORKSPACE
@@ -29,29 +30,9 @@ import StatusBadge from "../common/StatusBadge";
 
 const MAX_UPLOAD_MB = 2;
 
-const formatDate = (value) => {
 
-    if (!value) return "-";
 
-    const parsed = new Date(value);
 
-    return Number.isNaN(parsed.getTime())
-        ? "-"
-        : parsed.toLocaleDateString();
-
-};
-
-const formatDateTime = (value) => {
-
-    if (!value) return "-";
-
-    const parsed = new Date(value);
-
-    return Number.isNaN(parsed.getTime())
-        ? "-"
-        : parsed.toLocaleString();
-
-};
 
 function WorkerTasks({ roleLabel = "Employee" }) {
 

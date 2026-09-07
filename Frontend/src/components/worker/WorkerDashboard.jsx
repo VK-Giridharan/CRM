@@ -6,6 +6,7 @@ import { getDashboard } from "../../services/dashboardService";
 import StatCard from "../common/StatCard";
 import StatusBreakdown from "../common/StatusBreakdown";
 import StatusBadge from "../common/StatusBadge";
+import { formatDate } from "../../utils/formatDate";
 
 // ======================================================
 // WORKER DASHBOARD
@@ -15,17 +16,7 @@ import StatusBadge from "../common/StatusBadge";
 // inside their own company.
 // ======================================================
 
-const formatDate = (value) => {
 
-    if (!value) return "-";
-
-    const parsed = new Date(value);
-
-    return Number.isNaN(parsed.getTime())
-        ? "-"
-        : parsed.toLocaleDateString();
-
-};
 
 function WorkerDashboard({ roleLabel = "Employee", basePath = "/employee" }) {
 

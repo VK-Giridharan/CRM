@@ -5,6 +5,7 @@ import { createTask, taskList, updateTask, deleteTask, assignTask } from "../../
 import { customerList } from "../../services/customerService";
 
 import { getWorkers } from "../../services/workerService";
+import { formatDate } from "../../utils/formatDate";
 
 function Tasks() {
 
@@ -489,7 +490,7 @@ function Tasks() {
 
                                             <td className="px-5 py-3">
 
-                                                {task.due_date}
+                                                {formatDate(task.due_date)}
 
                                             </td>
 

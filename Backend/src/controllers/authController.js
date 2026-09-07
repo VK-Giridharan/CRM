@@ -5,12 +5,24 @@ const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 
 const { getAuthContext } = require("../utils/authContext");
+const {
+    registerFailedLogin,
+    clearFailedLogins
+} = require("../middleware/rateLimitMiddleware");
 const { ROLES } = require("../utils/status");
 
-const BCRYPT_ROUNDS = 10;
-const MIN_PASSWORD_LENGTH = 8;
+const {
+    parseId,
+    validateName,
+    validateEmail,
+    validatePhone,
+    validatePassword,
+    firstError,
+    MIN_PASSWORD_LENGTH,
+    EMAIL_PATTERN
+} = require("../utils/validation");
 
-const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const BCRYPT_ROUNDS = 10;
 
 // Roles a Manager is allowed to grant
 const MANAGER_ASSIGNABLE_ROLES = [
@@ -33,6 +45,8 @@ exports.register = async (req, res) => {
 
         const { first_name, last_name, email, phone, password } = req.body;
 
+        // Presence first, so the existing "All required fields are mandatory"
+        // message is preserved for a genuinely empty request.
         if (!first_name || !email || !phone || !password) {
             return res.status(400).json({
                 success: false,
@@ -40,17 +54,21 @@ exports.register = async (req, res) => {
             });
         }
 
-        if (!EMAIL_PATTERN.test(String(email).trim())) {
-            return res.status(400).json({
-                success: false,
-                message: "Please enter a valid email address"
-            });
-        }
+        // Format validation. Previously phone was not validated at all, so a
+        // direct API call could store "abcdefghij" or a 15-digit number even
+        // though the Register screen enforces exactly 10 digits.
+        const validationError = firstError([
+            validateName(first_name, "First name"),
+            validateName(last_name, "Last name", { required: false }),
+            validateEmail(email),
+            validatePhone(phone),
+            validatePassword(password)
+        ]);
 
-        if (String(password).length < MIN_PASSWORD_LENGTH) {
+        if (validationError) {
             return res.status(400).json({
                 success: false,
-                message: `Password must be at least ${MIN_PASSWORD_LENGTH} characters`
+                message: validationError
             });
         }
 
@@ -130,6 +148,19 @@ exports.login = async (req, res) => {
             });
         }
 
+        // Reject non-primitive values before they reach bcrypt.compare, which
+        // throws on a non-string and previously escaped as a 500. Both fields
+        // are checked so neither can be used to trigger a server error.
+        if (typeof password !== "string" ||
+            (typeof emailOrPhone !== "string" && typeof emailOrPhone !== "number")) {
+
+            return res.status(400).json({
+                success: false,
+                message: "Email/Phone and Password must be text"
+            });
+
+        }
+
         const identifier = String(emailOrPhone).trim();
 
         // Only the columns actually needed - the password hash is read for
@@ -145,6 +176,7 @@ exports.login = async (req, res) => {
         );
 
         if (result.rows.length === 0) {
+            registerFailedLogin(req);
             return res.status(401).json({
                 success: false,
                 message: "Invalid Credentials"
@@ -163,6 +195,7 @@ exports.login = async (req, res) => {
         const isMatch = await bcrypt.compare(password, user.password);
 
         if (!isMatch) {
+            registerFailedLogin(req);
             // Same message as "user not found" so login cannot be used to
             // discover which emails/phones are registered.
             return res.status(401).json({
@@ -170,6 +203,10 @@ exports.login = async (req, res) => {
                 message: "Invalid Credentials"
             });
         }
+
+        // Successful sign-in clears the counter, so a user who mistypes once
+        // and then gets it right is never throttled.
+        clearFailedLogins(req);
 
         await pool.query(
             `UPDATE users SET last_login = NOW() WHERE id = $1`,
@@ -361,6 +398,17 @@ exports.changeRole = async (req, res) => {
             });
         }
 
+        // Validate the id in the application so a value like "abc" returns a
+        // 400 instead of reaching Postgres and surfacing as a 500.
+        const targetUserId = parseId(user_id);
+
+        if (!targetUserId) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid User Id"
+            });
+        }
+
         const currentUser = await getAuthContext(req.user.id);
 
         if (!currentUser) {
@@ -372,7 +420,7 @@ exports.changeRole = async (req, res) => {
 
         const targetResult = await pool.query(
             `SELECT id, role, company_id FROM users WHERE id = $1`,
-            [user_id]
+            [targetUserId]
         );
 
         if (targetResult.rows.length === 0) {
@@ -409,9 +457,18 @@ exports.changeRole = async (req, res) => {
                 });
             }
 
+            const targetCompanyId = parseId(company_id);
+
+            if (!targetCompanyId) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid Company Id"
+                });
+            }
+
             const companyCheck = await pool.query(
                 `SELECT id FROM companies WHERE id = $1`,
-                [company_id]
+                [targetCompanyId]
             );
 
             if (companyCheck.rows.length === 0) {
@@ -425,7 +482,7 @@ exports.changeRole = async (req, res) => {
                 `UPDATE users
                  SET role = $1, company_id = $2, updated_at = NOW()
                  WHERE id = $3`,
-                [role, company_id, user_id]
+                [role, targetCompanyId, targetUserId]
             );
 
             return res.status(200).json({
@@ -483,7 +540,7 @@ exports.changeRole = async (req, res) => {
                 `UPDATE users
                  SET role = $1, company_id = $2, updated_at = NOW()
                  WHERE id = $3`,
-                [role, currentUser.company_id, user_id]
+                [role, currentUser.company_id, targetUserId]
             );
 
             return res.status(200).json({
@@ -629,24 +686,19 @@ exports.updateProfile = async (req, res) => {
 
         const { first_name, last_name, email, phone } = req.body;
 
-        if (!first_name || !String(first_name).trim()) {
-            return res.status(400).json({
-                success: false,
-                message: "First name is required"
-            });
-        }
+        // Same rules as registration - phone in particular was previously
+        // only checked for presence, so "123" was accepted here.
+        const validationError = firstError([
+            validateName(first_name, "First name"),
+            validateName(last_name, "Last name", { required: false }),
+            validateEmail(email),
+            validatePhone(phone)
+        ]);
 
-        if (!email || !EMAIL_PATTERN.test(String(email).trim())) {
+        if (validationError) {
             return res.status(400).json({
                 success: false,
-                message: "Please enter a valid email address"
-            });
-        }
-
-        if (!phone || !String(phone).trim()) {
-            return res.status(400).json({
-                success: false,
-                message: "Phone number is required"
+                message: validationError
             });
         }
 
@@ -721,10 +773,19 @@ exports.changePassword = async (req, res) => {
             });
         }
 
-        if (String(newPassword).length < MIN_PASSWORD_LENGTH) {
+        if (typeof currentPassword !== "string" || typeof newPassword !== "string") {
             return res.status(400).json({
                 success: false,
-                message: `New password must be at least ${MIN_PASSWORD_LENGTH} characters`
+                message: "Passwords must be text"
+            });
+        }
+
+        const passwordError = validatePassword(newPassword, "New password");
+
+        if (passwordError) {
+            return res.status(400).json({
+                success: false,
+                message: passwordError
             });
         }
 
@@ -761,8 +822,15 @@ exports.changePassword = async (req, res) => {
 
         const hash = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
 
+        // password_changed_at is stamped so authMiddleware can reject any JWT
+        // that was issued before this moment - changing the password now
+        // genuinely ends every other session.
         await pool.query(
-            "UPDATE users SET password = $1, updated_at = NOW() WHERE id = $2",
+            `UPDATE users
+             SET password = $1,
+                 password_changed_at = NOW(),
+                 updated_at = NOW()
+             WHERE id = $2`,
             [hash, req.user.id]
         );
 
@@ -884,10 +952,139 @@ exports.forgotPassword = async (req, res) => {
 
     } catch (error) {
 
-        // Never leak the token or the failure reason.
-        console.error("FORGOT PASSWORD ERROR:", error.message);
+        // The response stays generic so the endpoint cannot be used to
+        // enumerate accounts, but the failure is logged loudly: previously a
+        // missing password_resets table made this path swallow every error
+        // while still telling the user a link had been generated.
+        console.error(
+            "FORGOT PASSWORD FAILED - no reset token was created:",
+            error.message
+        );
 
         return res.status(200).json(genericResponse);
+
+    }
+
+};
+
+// ======================================================
+// ADMIN-ASSISTED RESET LINK
+//
+// This project has no email infrastructure, so a self-service reset token
+// can never reach the user. Without a delivery path the whole reset feature
+// is unusable in production (the reset screen asks for a token the user has
+// no way to obtain).
+//
+// This endpoint is that delivery path: an Admin generates a single-use link
+// for a specific user and passes it on through a channel they already trust.
+//
+// Security properties:
+//   * Admin only, enforced by requireRole on the route.
+//   * The token is generated exactly like the self-service flow - random 32
+//     bytes, only the SHA-256 hash is stored, single use, same TTL.
+//   * Any outstanding token for that user is invalidated first.
+//   * Disabled accounts are refused.
+//   * The raw token is returned ONLY to the authenticated Admin who asked
+//     for it, never to an anonymous caller.
+// ======================================================
+
+exports.adminGenerateResetLink = async (req, res) => {
+
+    const client = await pool.connect();
+
+    try {
+
+        const { user_id } = req.body;
+
+        const targetId = parseId(user_id);
+
+        if (!targetId) {
+            return res.status(400).json({
+                success: false,
+                message: "A valid User Id is required"
+            });
+        }
+
+        const userResult = await client.query(
+            `SELECT id, email, first_name, last_name, is_active
+             FROM users
+             WHERE id = $1`,
+            [targetId]
+        );
+
+        if (userResult.rows.length === 0) {
+            return res.status(404).json({
+                success: false,
+                message: "User Not Found"
+            });
+        }
+
+        const user = userResult.rows[0];
+
+        if (!user.is_active) {
+            return res.status(400).json({
+                success: false,
+                message: "This account is disabled. Re-enable it before resetting the password."
+            });
+        }
+
+        const ttlMinutes = Number(process.env.RESET_TOKEN_TTL_MINUTES) || 30;
+
+        const rawToken = crypto.randomBytes(32).toString("hex");
+        const tokenHash = hashResetToken(rawToken);
+
+        await client.query("BEGIN");
+
+        await client.query(
+            `UPDATE password_resets
+             SET used_at = CURRENT_TIMESTAMP
+             WHERE user_id = $1
+               AND used_at IS NULL`,
+            [targetId]
+        );
+
+        await client.query(
+            `INSERT INTO password_resets (user_id, token_hash, expires_at)
+             VALUES ($1, $2, CURRENT_TIMESTAMP + ($3 || ' minutes')::interval)`,
+            [targetId, tokenHash, String(ttlMinutes)]
+        );
+
+        await client.query("COMMIT");
+
+        const appUrl = (process.env.APP_URL || "http://localhost:5173")
+            .replace(/\/+$/, "");
+
+        return res.status(200).json({
+            success: true,
+            message: "Reset link generated. Share it with the user directly.",
+            data: {
+                user_id: user.id,
+                email: user.email,
+                name: `${user.first_name} ${user.last_name || ""}`.trim(),
+                reset_token: rawToken,
+                reset_url: `${appUrl}/reset-password?token=${rawToken}`,
+                expires_in_minutes: ttlMinutes
+            }
+        });
+
+    } catch (error) {
+
+        try {
+            await client.query("ROLLBACK");
+        } catch (rollbackError) {
+            // connection already unusable
+        }
+
+        console.error("ADMIN RESET LINK ERROR:", error.message);
+
+        return res.status(500).json({
+            success: false,
+            message: "Internal Server Error"
+        });
+
+    } finally {
+
+        client.release();
 
     }
 
@@ -916,10 +1113,19 @@ exports.resetPassword = async (req, res) => {
             });
         }
 
-        if (String(newPassword).length < MIN_PASSWORD_LENGTH) {
+        const passwordError = validatePassword(newPassword);
+
+        if (passwordError) {
             return res.status(400).json({
                 success: false,
-                message: `Password must be at least ${MIN_PASSWORD_LENGTH} characters`
+                message: passwordError
+            });
+        }
+
+        if (typeof token !== "string") {
+            return res.status(400).json({
+                success: false,
+                message: "This reset link is invalid or has expired"
             });
         }
 
@@ -962,9 +1168,14 @@ exports.resetPassword = async (req, res) => {
 
         await client.query("BEGIN");
 
+        // Stamping password_changed_at invalidates every JWT issued before
+        // the reset, so a stolen token cannot outlive the password it was
+        // obtained with.
         await client.query(
             `UPDATE users
-             SET password = $1, updated_at = NOW()
+             SET password = $1,
+                 password_changed_at = NOW(),
+                 updated_at = NOW()
              WHERE id = $2`,
             [hash, resetRow.user_id]
         );

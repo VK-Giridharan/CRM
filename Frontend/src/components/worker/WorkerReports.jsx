@@ -7,6 +7,7 @@ import {
 } from "../../services/taskReportService";
 
 import StatusBadge from "../common/StatusBadge";
+import { formatDateTime } from "../../utils/formatDate";
 
 // ======================================================
 // WORKER REPORTS
@@ -26,17 +27,7 @@ import StatusBadge from "../common/StatusBadge";
 //   attachment_original_name, has_attachment
 // ======================================================
 
-const formatDateTime = (value) => {
 
-    if (!value) return "-";
-
-    const parsed = new Date(value);
-
-    return Number.isNaN(parsed.getTime())
-        ? "-"
-        : parsed.toLocaleString();
-
-};
 
 function WorkerReports({ roleLabel = "Employee" }) {
 

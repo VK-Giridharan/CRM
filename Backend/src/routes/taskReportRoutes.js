@@ -5,6 +5,7 @@ const router = express.Router();
 const {
     submitTaskReport,
     teamLeadReportList,
+    managerReportList,
     getTaskReportDetails,
     reviewTaskReport,
     myTaskReports,
@@ -41,6 +42,14 @@ router.get(
     "/team-lead",
     verifyToken,
     teamLeadReportList
+);
+
+// Manager - every report produced inside their own company.
+// Literal path, so it must stay above the "/:id" wildcard below.
+router.get(
+    "/manager",
+    verifyToken,
+    managerReportList
 );
 
 // Any worker - reports they submitted

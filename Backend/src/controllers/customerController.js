@@ -2,6 +2,47 @@ const pool = require("../database/connection");
 const { getAuthContext } = require("../utils/authContext");
 const { ROLES } = require("../utils/status");
 
+const {
+    parseId,
+    validateName,
+    validateEmail,
+    validatePhone,
+    validateText,
+    validateShortText,
+    firstError
+} = require("../utils/validation");
+
+// ======================================================
+// WHO MAY WRITE A CUSTOMER
+//
+// createCustomer has always been Manager-only. updateCustomer and
+// deleteCustomer checked company membership but never the caller's role, so
+// an Employee or an Intern could edit or soft-delete any customer in their
+// own company (report BUG-005, CRITICAL).
+//
+// Admin is kept because the existing update/delete handlers already carve
+// Admin out of the company check and act as a global administrator there.
+// Team Lead, Employee and Intern are read-only on customers.
+// ======================================================
+const CUSTOMER_WRITE_ROLES = [ROLES.ADMIN, ROLES.MANAGER];
+
+// Columns a client is allowed to update, mapped to their validator.
+// Anything not listed here can never be written by updateCustomer.
+const CUSTOMER_UPDATABLE_FIELDS = {
+    customer_name: (v) => validateName(v, "Customer name"),
+    company_name: (v) => validateName(v, "Company name", { required: false }),
+    email: (v) => validateEmail(v, { required: false }),
+    phone: (v) => validatePhone(v),
+    alternate_phone: (v) => validatePhone(v, { required: false, label: "Alternate phone" }),
+    gst_number: (v) => validateShortText(v, "GST number"),
+    website: (v) => validateShortText(v, "Website"),
+    address: (v) => validateText(v, "Address"),
+    city: (v) => validateName(v, "City", { required: false }),
+    state: (v) => validateName(v, "State", { required: false }),
+    country: (v) => validateName(v, "Country", { required: false }),
+    pincode: (v) => validateShortText(v, "Pincode")
+};
+
 // ======================================================
 // customers.company_id is the tenant key and is always taken from the
 // authenticated user's row - never from the request body.
@@ -50,6 +91,31 @@ exports.createCustomer = async (req, res) => {
             });
         }
 
+        // Format validation. Previously nothing beyond presence was checked,
+        // so "not-an-email", "abcdefghij" and a 25-digit phone (which
+        // overflowed varchar(20) and became a 500) all got through.
+        const validationError = firstError([
+            validateName(customer_name, "Customer name"),
+            validateName(company_name, "Company name", { required: false }),
+            validatePhone(phone),
+            validatePhone(alternate_phone, { required: false, label: "Alternate phone" }),
+            validateEmail(email, { required: false }),
+            validateShortText(gst_number, "GST number"),
+            validateShortText(website, "Website"),
+            validateText(address, "Address"),
+            validateName(city, "City", { required: false }),
+            validateName(state, "State", { required: false }),
+            validateName(country, "Country", { required: false }),
+            validateShortText(pincode, "Pincode")
+        ]);
+
+        if (validationError) {
+            return res.status(400).json({
+                success: false,
+                message: validationError
+            });
+        }
+
         const authUser = await getAuthContext(req.user.id);
 
         if (!authUser) {
@@ -70,6 +136,26 @@ exports.createCustomer = async (req, res) => {
             return res.status(403).json({
                 success: false,
                 message: "You are not assigned to a company"
+            });
+        }
+
+        // Duplicate detection, scoped to the caller's own company so it can
+        // never reveal anything about another tenant's customers.
+        // Soft-deleted rows are ignored, so a deleted customer's phone can
+        // be reused.
+        const duplicate = await pool.query(
+            `SELECT id
+             FROM customers
+             WHERE company_id = $1
+               AND phone = $2
+               AND deleted_at IS NULL`,
+            [authUser.company_id, String(phone).trim()]
+        );
+
+        if (duplicate.rows.length > 0) {
+            return res.status(400).json({
+                success: false,
+                message: "A customer with this phone number already exists"
             });
         }
 
@@ -309,6 +395,15 @@ exports.customerDetails = async (req, res) => {
             });
         }
 
+        const id = parseId(customer_id);
+
+        if (!id) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid Customer Id"
+            });
+        }
+
         const authUser = await getAuthContext(req.user.id);
 
         if (!authUser) {
@@ -323,7 +418,7 @@ exports.customerDetails = async (req, res) => {
              FROM customers
              WHERE id = $1
                AND deleted_at IS NULL`,
-            [customer_id]
+            [id]
         );
 
         if (result.rows.length === 0) {
@@ -367,27 +462,21 @@ exports.updateCustomer = async (req, res) => {
 
     try {
 
-        const {
-            customer_id,
-            customer_name,
-            company_name,
-            email,
-            phone,
-            alternate_phone,
-            gst_number,
-            website,
-            address,
-            city,
-            state,
-            country,
-            pincode,
-            status
-        } = req.body;
+        const { customer_id, status } = req.body;
 
         if (!customer_id) {
             return res.status(400).json({
                 success: false,
                 message: "Customer Id is required"
+            });
+        }
+
+        const id = parseId(customer_id);
+
+        if (!id) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid Customer Id"
             });
         }
 
@@ -400,12 +489,21 @@ exports.updateCustomer = async (req, res) => {
             });
         }
 
+        // Role gate (BUG-005). Team Lead / Employee / Intern are read-only on
+        // customers; only Admin and Manager may write.
+        if (!CUSTOMER_WRITE_ROLES.includes(authUser.role)) {
+            return res.status(403).json({
+                success: false,
+                message: "Only Admin or Manager can update customers"
+            });
+        }
+
         const customer = await pool.query(
             `SELECT company_id
              FROM customers
              WHERE id = $1
                AND deleted_at IS NULL`,
-            [customer_id]
+            [id]
         );
 
         if (customer.rows.length === 0) {
@@ -426,39 +524,123 @@ exports.updateCustomer = async (req, res) => {
 
         }
 
+        // --------------------------------------------------
+        // PARTIAL UPDATE (BUG-006)
+        //
+        // The previous statement assigned every optional column directly, so
+        // any field the caller omitted was overwritten with NULL and the
+        // rest of the customer record was silently destroyed.
+        //
+        // Now only keys actually present in the request body are written:
+        //   key absent      -> column untouched
+        //   key present     -> column set to that value
+        //   key present ""  -> column explicitly cleared to NULL
+        //
+        // The field list is a fixed whitelist, so nothing outside
+        // CUSTOMER_UPDATABLE_FIELDS can ever be written from the body.
+        // --------------------------------------------------
+        const setClauses = [];
+        const values = [];
+
+        for (const [field, validate] of Object.entries(CUSTOMER_UPDATABLE_FIELDS)) {
+
+            if (!Object.prototype.hasOwnProperty.call(req.body, field)) {
+                continue;
+            }
+
+            const raw = req.body[field];
+
+            // An explicitly blank optional field clears the column.
+            const isBlank =
+                raw === null || raw === undefined || String(raw).trim() === "";
+
+            if (isBlank) {
+
+                // customer_name and phone are NOT NULL / required - refuse to
+                // blank them rather than corrupting the row.
+                if (field === "customer_name" || field === "phone") {
+                    return res.status(400).json({
+                        success: false,
+                        message: field === "phone"
+                            ? "Phone number is required"
+                            : "Customer name is required"
+                    });
+                }
+
+                values.push(null);
+                setClauses.push(`${field} = $${values.length}`);
+                continue;
+
+            }
+
+            const error = validate(raw);
+
+            if (error) {
+                return res.status(400).json({
+                    success: false,
+                    message: error
+                });
+            }
+
+            values.push(String(raw).trim());
+            setClauses.push(`${field} = $${values.length}`);
+
+        }
+
+        // status is a boolean column and is handled separately.
+        if (Object.prototype.hasOwnProperty.call(req.body, "status")) {
+
+            const boolStatus = toBoolean(status);
+
+            if (boolStatus === null) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Status must be true or false"
+                });
+            }
+
+            values.push(boolStatus);
+            setClauses.push(`status = $${values.length}`);
+
+        }
+
+        if (setClauses.length === 0) {
+            return res.status(400).json({
+                success: false,
+                message: "No fields to update"
+            });
+        }
+
+        // Phone uniqueness inside the company, mirroring create.
+        if (Object.prototype.hasOwnProperty.call(req.body, "phone")) {
+
+            const clash = await pool.query(
+                `SELECT id
+                 FROM customers
+                 WHERE company_id = $1
+                   AND phone = $2
+                   AND id <> $3
+                   AND deleted_at IS NULL`,
+                [customer.rows[0].company_id, String(req.body.phone).trim(), id]
+            );
+
+            if (clash.rows.length > 0) {
+                return res.status(400).json({
+                    success: false,
+                    message: "A customer with this phone number already exists"
+                });
+            }
+
+        }
+
+        values.push(id);
+
         await pool.query(
             `UPDATE customers
-             SET customer_name   = COALESCE($1, customer_name),
-                 company_name    = $2,
-                 email           = $3,
-                 phone           = COALESCE($4, phone),
-                 alternate_phone = $5,
-                 gst_number      = $6,
-                 website         = $7,
-                 address         = $8,
-                 city            = $9,
-                 state           = $10,
-                 country         = $11,
-                 pincode         = $12,
-                 status          = COALESCE($13, status),
-                 updated_at      = NOW()
-             WHERE id = $14`,
-            [
-                customer_name ? String(customer_name).trim() : null,
-                company_name ?? null,
-                email ?? null,
-                phone || null,
-                alternate_phone ?? null,
-                gst_number ?? null,
-                website ?? null,
-                address ?? null,
-                city ?? null,
-                state ?? null,
-                country ?? null,
-                pincode ?? null,
-                toBoolean(status),
-                customer_id
-            ]
+             SET ${setClauses.join(", ")},
+                 updated_at = NOW()
+             WHERE id = $${values.length}`,
+            values
         );
 
         return res.status(200).json({
@@ -494,6 +676,15 @@ exports.deleteCustomer = async (req, res) => {
             });
         }
 
+        const id = parseId(customer_id);
+
+        if (!id) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid Customer Id"
+            });
+        }
+
         const authUser = await getAuthContext(req.user.id);
 
         if (!authUser) {
@@ -503,12 +694,21 @@ exports.deleteCustomer = async (req, res) => {
             });
         }
 
+        // Role gate (BUG-005). An Intern was previously able to soft-delete
+        // any customer in their own company.
+        if (!CUSTOMER_WRITE_ROLES.includes(authUser.role)) {
+            return res.status(403).json({
+                success: false,
+                message: "Only Admin or Manager can delete customers"
+            });
+        }
+
         const customer = await pool.query(
             `SELECT id, company_id
              FROM customers
              WHERE id = $1
                AND deleted_at IS NULL`,
-            [customer_id]
+            [id]
         );
 
         if (customer.rows.length === 0) {
@@ -532,7 +732,7 @@ exports.deleteCustomer = async (req, res) => {
             `UPDATE customers
              SET deleted_at = NOW()
              WHERE id = $1`,
-            [customer_id]
+            [id]
         );
 
         return res.status(200).json({

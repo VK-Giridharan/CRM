@@ -1,6 +1,16 @@
 const pool = require("../database/connection");
 const { ROLES } = require("../utils/status");
 
+const {
+    parseId,
+    validateName,
+    validateEmail,
+    validatePhone,
+    validateText,
+    validateShortText,
+    firstError
+} = require("../utils/validation");
+
 // ======================================================
 // Company routes are wrapped in requireRole(...) so req.authUser is always
 // present here and carries the caller's freshly-read role / company_id.
@@ -32,6 +42,26 @@ exports.createCompany = async (req, res) => {
                 message: "Company Name and Company Code are required"
             });
 
+        }
+
+        const validationError = firstError([
+            validateName(company_name, "Company name"),
+            validateShortText(company_code, "Company code"),
+            validateEmail(email, { required: false }),
+            validatePhone(phone, { required: false }),
+            validateText(address, "Address"),
+            validateName(city, "City", { required: false }),
+            validateName(state, "State", { required: false }),
+            validateName(country, "Country", { required: false }),
+            validateShortText(pincode, "Pincode"),
+            validateShortText(logo, "Logo")
+        ]);
+
+        if (validationError) {
+            return res.status(400).json({
+                success: false,
+                message: validationError
+            });
         }
 
         const check = await pool.query(
@@ -160,11 +190,20 @@ exports.companyDetails = async (req, res) => {
             });
         }
 
+        const companyId = parseId(id);
+
+        if (!companyId) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid Company Id"
+            });
+        }
+
         const authUser = req.authUser;
 
         // A Manager may only read their own company.
         if (authUser.role !== ROLES.ADMIN &&
-            Number(id) !== Number(authUser.company_id)) {
+            companyId !== Number(authUser.company_id)) {
 
             return res.status(403).json({
                 success: false,
@@ -175,7 +214,7 @@ exports.companyDetails = async (req, res) => {
 
         const result = await pool.query(
             `SELECT * FROM companies WHERE id = $1`,
-            [id]
+            [companyId]
         );
 
         if (result.rows.length === 0) {
@@ -231,9 +270,38 @@ exports.updateCompany = async (req, res) => {
             });
         }
 
+        const companyId = parseId(id);
+
+        if (!companyId) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid Company Id"
+            });
+        }
+
+        const validationError = firstError([
+            validateName(company_name, "Company name", { required: false }),
+            validateShortText(company_code, "Company code"),
+            validateEmail(email, { required: false }),
+            validatePhone(phone, { required: false }),
+            validateText(address, "Address"),
+            validateName(city, "City", { required: false }),
+            validateName(state, "State", { required: false }),
+            validateName(country, "Country", { required: false }),
+            validateShortText(pincode, "Pincode"),
+            validateShortText(logo, "Logo")
+        ]);
+
+        if (validationError) {
+            return res.status(400).json({
+                success: false,
+                message: validationError
+            });
+        }
+
         const check = await pool.query(
             `SELECT id FROM companies WHERE id = $1`,
-            [id]
+            [companyId]
         );
 
         if (check.rows.length === 0) {
@@ -254,7 +322,7 @@ exports.updateCompany = async (req, res) => {
                 [
                     company_code ? String(company_code).trim() : "",
                     company_name ? String(company_name).trim() : "",
-                    id
+                    companyId
                 ]
             );
 
@@ -297,7 +365,7 @@ exports.updateCompany = async (req, res) => {
                 pincode ?? null,
                 logo ?? null,
                 typeof status === "boolean" ? status : null,
-                id
+                companyId
             ]
         );
 
@@ -340,9 +408,18 @@ exports.deleteCompany = async (req, res) => {
             });
         }
 
+        const companyId = parseId(id);
+
+        if (!companyId) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid Company Id"
+            });
+        }
+
         const check = await pool.query(
             `SELECT id FROM companies WHERE id = $1`,
-            [id]
+            [companyId]
         );
 
         if (check.rows.length === 0) {
@@ -358,7 +435,7 @@ exports.deleteCompany = async (req, res) => {
                 (SELECT COUNT(*) FROM customers WHERE company_id = $1) AS customers,
                 (SELECT COUNT(*) FROM leads     WHERE company_id = $1) AS leads,
                 (SELECT COUNT(*) FROM meetings  WHERE company_id = $1) AS meetings`,
-            [id]
+            [companyId]
         );
 
         const counts = dependents.rows[0];
@@ -376,7 +453,7 @@ exports.deleteCompany = async (req, res) => {
             });
         }
 
-        await pool.query(`DELETE FROM companies WHERE id = $1`, [id]);
+        await pool.query(`DELETE FROM companies WHERE id = $1`, [companyId]);
 
         return res.status(200).json({
             success: true,

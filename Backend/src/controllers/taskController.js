@@ -6,9 +6,22 @@ const {
     TEAM_LEAD_ASSIGNABLE_SPLIT_STATUSES,
     TASK_STATUS,
     TASK_STATUSES,
+    TASK_PRIORITIES,
     ROLES,
     WORKER_ROLES
 } = require("../utils/status");
+
+const {
+    parseId,
+    parseDateOnly,
+    validateName,
+    validateText,
+    validateDate,
+    validateDateOrder,
+    firstError
+} = require("../utils/validation");
+
+const { syncAssignmentAndTask, syncFromSplitTask } = require("../utils/taskRollup");
 
 // ======================================================
 // COMPANY SCOPING
@@ -92,6 +105,40 @@ exports.createTask = async (req, res) => {
             });
         }
 
+        const customerId = parseId(customer_id);
+
+        if (!customerId) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid Customer Id"
+            });
+        }
+
+        // priority was previously accepted verbatim, so "SUPER_URGENT" was
+        // persisted; dates were passed straight to Postgres, so "notadate"
+        // became a 500 (report BUG-011).
+        if (priority && !TASK_PRIORITIES.includes(priority)) {
+            return res.status(400).json({
+                success: false,
+                message: `Priority must be one of: ${TASK_PRIORITIES.join(", ")}`
+            });
+        }
+
+        const validationError = firstError([
+            validateName(title, "Title"),
+            validateText(description, "Description"),
+            validateDate(start_date, "Start date"),
+            validateDate(due_date, "Due date"),
+            validateDateOrder(start_date, due_date, "Start date", "Due date")
+        ]);
+
+        if (validationError) {
+            return res.status(400).json({
+                success: false,
+                message: validationError
+            });
+        }
+
         const manager_id = req.user.id;
 
         const authUser = await getAuthContext(manager_id);
@@ -116,7 +163,7 @@ exports.createTask = async (req, res) => {
              FROM customers
              WHERE id = $1
                AND deleted_at IS NULL`,
-            [customer_id]
+            [customerId]
         );
 
         if (customerResult.rows.length === 0) {
@@ -147,13 +194,13 @@ exports.createTask = async (req, res) => {
             VALUES ($1, $2, $3, $4, $5, $6, $7)
             RETURNING id`,
             [
-                customer_id,
+                customerId,
                 manager_id,
                 String(title).trim(),
                 description || null,
                 priority || "Medium",
-                start_date || null,
-                due_date || null
+                parseDateOnly(start_date),
+                parseDateOnly(due_date)
             ]
         );
 
@@ -285,6 +332,15 @@ exports.taskDetails = async (req, res) => {
             });
         }
 
+        const taskId = parseId(task_id);
+
+        if (!taskId) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid Task ID"
+            });
+        }
+
         const authUser = await getAuthContext(req.user.id);
 
         if (!authUser) {
@@ -321,7 +377,7 @@ exports.taskDetails = async (req, res) => {
                 ON u.id = t.manager_id
              WHERE t.id = $1
                AND t.deleted_at IS NULL`,
-            [task_id]
+            [taskId]
         );
 
         if (taskResult.rows.length === 0) {
@@ -358,7 +414,7 @@ exports.taskDetails = async (req, res) => {
                 ON u.id = ta.team_lead_id
              WHERE ta.task_id = $1
              ORDER BY ta.id DESC`,
-            [task_id]
+            [taskId]
         );
 
         const assignments = assignmentsResult.rows;
@@ -431,10 +487,41 @@ exports.updateTask = async (req, res) => {
             });
         }
 
+        const taskId = parseId(task_id);
+
+        if (!taskId) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid Task ID"
+            });
+        }
+
         if (status && !TASK_STATUSES.includes(status)) {
             return res.status(400).json({
                 success: false,
                 message: "Invalid Task Status"
+            });
+        }
+
+        if (priority && !TASK_PRIORITIES.includes(priority)) {
+            return res.status(400).json({
+                success: false,
+                message: `Priority must be one of: ${TASK_PRIORITIES.join(", ")}`
+            });
+        }
+
+        const validationError = firstError([
+            validateName(title, "Title", { required: false }),
+            validateText(description, "Description"),
+            validateDate(start_date, "Start date"),
+            validateDate(due_date, "Due date"),
+            validateDateOrder(start_date, due_date, "Start date", "Due date")
+        ]);
+
+        if (validationError) {
+            return res.status(400).json({
+                success: false,
+                message: validationError
             });
         }
 
@@ -454,7 +541,7 @@ exports.updateTask = async (req, res) => {
             });
         }
 
-        const taskCompanyId = await getTaskCompanyId(task_id);
+        const taskCompanyId = await getTaskCompanyId(taskId);
 
         if (taskCompanyId === null) {
             return res.status(404).json({
@@ -470,26 +557,68 @@ exports.updateTask = async (req, res) => {
             });
         }
 
+        // --------------------------------------------------
+        // PARTIAL UPDATE (BUG-012)
+        //
+        // description, start_date and due_date used to be assigned directly,
+        // so a title-only edit silently wiped the task's description and its
+        // whole schedule. Only keys actually present in the body are written
+        // now:
+        //   key absent     -> column untouched
+        //   key present    -> column set
+        //   key present "" -> column explicitly cleared
+        // --------------------------------------------------
+        const has = (key) =>
+            Object.prototype.hasOwnProperty.call(req.body, key);
+
+        const setClauses = [];
+        const values = [];
+
+        const push = (column, value) => {
+            values.push(value);
+            setClauses.push(`${column} = $${values.length}`);
+        };
+
+        if (has("title") && title && String(title).trim()) {
+            push("title", String(title).trim());
+        }
+
+        if (has("description")) {
+            push("description", description ? String(description).trim() : null);
+        }
+
+        if (has("priority") && priority) {
+            push("priority", priority);
+        }
+
+        if (has("start_date")) {
+            push("start_date", parseDateOnly(start_date));
+        }
+
+        if (has("due_date")) {
+            push("due_date", parseDateOnly(due_date));
+        }
+
+        if (has("status") && status) {
+            push("status", status);
+        }
+
+        if (setClauses.length === 0) {
+            return res.status(400).json({
+                success: false,
+                message: "No fields to update"
+            });
+        }
+
+        values.push(taskId);
+
         await pool.query(
             `UPDATE tasks
-             SET title       = COALESCE($1, title),
-                 description = $2,
-                 priority    = COALESCE($3, priority),
-                 start_date  = $4,
-                 due_date    = $5,
-                 status      = COALESCE($6, status),
-                 updated_at  = NOW()
-             WHERE id = $7
+             SET ${setClauses.join(", ")},
+                 updated_at = NOW()
+             WHERE id = $${values.length}
                AND deleted_at IS NULL`,
-            [
-                title ? String(title).trim() : null,
-                description || null,
-                priority || null,
-                start_date || null,
-                due_date || null,
-                status || null,
-                task_id
-            ]
+            values
         );
 
         return res.status(200).json({
@@ -528,6 +657,15 @@ exports.deleteTask = async (req, res) => {
             });
         }
 
+        const taskId = parseId(task_id);
+
+        if (!taskId) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid Task ID"
+            });
+        }
+
         const authUser = await getAuthContext(req.user.id);
 
         if (!authUser) {
@@ -544,7 +682,7 @@ exports.deleteTask = async (req, res) => {
             });
         }
 
-        const taskCompanyId = await getTaskCompanyId(task_id);
+        const taskCompanyId = await getTaskCompanyId(taskId);
 
         if (taskCompanyId === null) {
             return res.status(404).json({
@@ -565,7 +703,7 @@ exports.deleteTask = async (req, res) => {
              SET deleted_at = NOW()
              WHERE id = $1
                AND deleted_at IS NULL`,
-            [task_id]
+            [taskId]
         );
 
         return res.status(200).json({
@@ -605,6 +743,16 @@ exports.assignTask = async (req, res) => {
             });
         }
 
+        const taskId = parseId(task_id);
+        const teamLeadId = parseId(employee_id);
+
+        if (!taskId || !teamLeadId) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid Task ID or Team Lead ID"
+            });
+        }
+
         const authUser = await getAuthContext(req.user.id);
 
         if (!authUser) {
@@ -622,7 +770,7 @@ exports.assignTask = async (req, res) => {
         }
 
         // --- task must be in the manager's company ---
-        const taskCompanyId = await getTaskCompanyId(task_id);
+        const taskCompanyId = await getTaskCompanyId(taskId);
 
         if (taskCompanyId === null) {
             return res.status(404).json({
@@ -643,7 +791,7 @@ exports.assignTask = async (req, res) => {
             `SELECT id, role, company_id, is_active
              FROM users
              WHERE id = $1`,
-            [employee_id]
+            [teamLeadId]
         );
 
         if (teamLeadResult.rows.length === 0) {
@@ -682,7 +830,7 @@ exports.assignTask = async (req, res) => {
              FROM task_assignments
              WHERE task_id = $1
                AND team_lead_id = $2`,
-            [task_id, employee_id]
+            [taskId, teamLeadId]
         );
 
         if (duplicate.rows.length > 0) {
@@ -697,7 +845,7 @@ exports.assignTask = async (req, res) => {
             `INSERT INTO task_assignments (task_id, team_lead_id)
              VALUES ($1, $2)
              RETURNING id`,
-            [task_id, employee_id]
+            [taskId, teamLeadId]
         );
 
         return res.status(201).json({
@@ -737,6 +885,15 @@ exports.assignedWorkers = async (req, res) => {
             });
         }
 
+        const taskId = parseId(task_id);
+
+        if (!taskId) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid Task ID"
+            });
+        }
+
         const authUser = await getAuthContext(req.user.id);
 
         if (!authUser) {
@@ -746,7 +903,7 @@ exports.assignedWorkers = async (req, res) => {
             });
         }
 
-        const taskCompanyId = await getTaskCompanyId(task_id);
+        const taskCompanyId = await getTaskCompanyId(taskId);
 
         if (taskCompanyId === null) {
             return res.status(404).json({
@@ -781,7 +938,7 @@ exports.assignedWorkers = async (req, res) => {
                 ON u.id = ta.team_lead_id
              WHERE ta.task_id = $1
              ORDER BY ta.id DESC`,
-            [task_id]
+            [taskId]
         );
 
         return res.status(200).json({
@@ -823,6 +980,15 @@ exports.changeTaskStatus = async (req, res) => {
             });
         }
 
+        const assignmentId = parseId(assignment_id);
+
+        if (!assignmentId) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid Assignment ID"
+            });
+        }
+
         if (!TASK_STATUSES.includes(status)) {
             return res.status(400).json({
                 success: false,
@@ -839,7 +1005,7 @@ exports.changeTaskStatus = async (req, res) => {
             });
         }
 
-        const assignment = await getAssignmentWithCompany(assignment_id);
+        const assignment = await getAssignmentWithCompany(assignmentId);
 
         if (!assignment) {
             return res.status(404).json({
@@ -877,7 +1043,7 @@ exports.changeTaskStatus = async (req, res) => {
              SET status = $1,
                  completed_at = COALESCE($2, completed_at)
              WHERE id = $3`,
-            [status, completedAt, assignment_id]
+            [status, completedAt, assignmentId]
         );
 
         return res.status(200).json({
@@ -1009,6 +1175,15 @@ exports.splitTaskList = async (req, res) => {
             });
         }
 
+        const assignmentId = parseId(task_assignment_id);
+
+        if (!assignmentId) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid Task Assignment ID"
+            });
+        }
+
         const team_lead_id = req.user.id;
 
         const authUser = await getAuthContext(team_lead_id);
@@ -1027,7 +1202,7 @@ exports.splitTaskList = async (req, res) => {
             });
         }
 
-        const assignment = await getAssignmentWithCompany(task_assignment_id);
+        const assignment = await getAssignmentWithCompany(assignmentId);
 
         if (!assignment) {
             return res.status(404).json({
@@ -1082,7 +1257,7 @@ exports.splitTaskList = async (req, res) => {
                 ON u.id = st.employee_id
              WHERE st.parent_assignment_id = $1
              ORDER BY st.id ASC`,
-            [task_assignment_id]
+            [assignmentId]
         );
 
         return res.status(200).json({
@@ -1130,6 +1305,29 @@ exports.createSplitTask = async (req, res) => {
             });
         }
 
+        const parentAssignmentId = parseId(parent_assignment_id);
+        const workerId = parseId(employee_id);
+
+        if (!parentAssignmentId || !workerId) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid Parent Assignment or Employee ID"
+            });
+        }
+
+        const validationError = firstError([
+            validateName(title, "Title"),
+            validateText(description, "Description"),
+            validateText(remarks, "Remarks")
+        ]);
+
+        if (validationError) {
+            return res.status(400).json({
+                success: false,
+                message: validationError
+            });
+        }
+
         const team_lead_id = req.user.id;
 
         const authUser = await getAuthContext(team_lead_id);
@@ -1148,7 +1346,7 @@ exports.createSplitTask = async (req, res) => {
             });
         }
 
-        const assignment = await getAssignmentWithCompany(parent_assignment_id);
+        const assignment = await getAssignmentWithCompany(parentAssignmentId);
 
         if (!assignment) {
             return res.status(404).json({
@@ -1172,7 +1370,7 @@ exports.createSplitTask = async (req, res) => {
             `SELECT id, role, company_id, is_active
              FROM users
              WHERE id = $1`,
-            [employee_id]
+            [workerId]
         );
 
         if (workerResult.rows.length === 0) {
@@ -1227,14 +1425,19 @@ exports.createSplitTask = async (req, res) => {
             VALUES ($1, $2, $3, $4, $5, $6)
             RETURNING *`,
             [
-                parent_assignment_id,
+                parentAssignmentId,
                 String(title).trim(),
                 description || null,
-                employee_id,
+                workerId,
                 requestedStatus,
                 remarks || null
             ]
         );
+
+        // Adding work under an assignment re-derives the parent statuses, so
+        // a new Pending split re-opens an assignment that had been rolled up
+        // to Completed.
+        await syncAssignmentAndTask(parentAssignmentId);
 
         return res.status(201).json({
             success: true,
@@ -1285,6 +1488,37 @@ exports.updateSplitTask = async (req, res) => {
             });
         }
 
+        const splitTaskId = parseId(split_task_id);
+
+        if (!splitTaskId) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid Split Task ID"
+            });
+        }
+
+        const workerId = employee_id ? parseId(employee_id) : null;
+
+        if (employee_id && !workerId) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid Employee ID"
+            });
+        }
+
+        const validationError = firstError([
+            validateName(title, "Title", { required: false }),
+            validateText(description, "Description"),
+            validateText(remarks, "Remarks")
+        ]);
+
+        if (validationError) {
+            return res.status(400).json({
+                success: false,
+                message: validationError
+            });
+        }
+
         const team_lead_id = req.user.id;
 
         const authUser = await getAuthContext(team_lead_id);
@@ -1320,7 +1554,7 @@ exports.updateSplitTask = async (req, res) => {
              INNER JOIN customers c
                 ON c.id = t.customer_id
              WHERE st.id = $1`,
-            [split_task_id]
+            [splitTaskId]
         );
 
         if (checkResult.rows.length === 0) {
@@ -1343,13 +1577,13 @@ exports.updateSplitTask = async (req, res) => {
         }
 
         // Reassignment, if requested, must stay inside the company.
-        if (employee_id) {
+        if (workerId) {
 
             const workerResult = await pool.query(
                 `SELECT id, role, company_id, is_active
                  FROM users
                  WHERE id = $1`,
-                [employee_id]
+                [workerId]
             );
 
             if (workerResult.rows.length === 0) {
@@ -1396,12 +1630,15 @@ exports.updateSplitTask = async (req, res) => {
             [
                 title ? String(title).trim() : null,
                 description ?? null,
-                employee_id || null,
+                workerId || null,
                 status || null,
                 remarks ?? null,
-                split_task_id
+                splitTaskId
             ]
         );
+
+        // A status change here can finish (or re-open) the parent assignment.
+        await syncFromSplitTask(splitTaskId);
 
         return res.status(200).json({
             success: true,
@@ -1436,6 +1673,15 @@ exports.changeSplitTaskStatus = async (req, res) => {
             return res.status(400).json({
                 success: false,
                 message: "Split Task ID and Status are required"
+            });
+        }
+
+        const splitTaskId = parseId(split_task_id);
+
+        if (!splitTaskId) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid Split Task ID"
             });
         }
 
@@ -1477,7 +1723,7 @@ exports.changeSplitTaskStatus = async (req, res) => {
              INNER JOIN customers c
                 ON c.id = t.customer_id
              WHERE st.id = $1`,
-            [split_task_id]
+            [splitTaskId]
         );
 
         if (checkResult.rows.length === 0) {
@@ -1508,8 +1754,11 @@ exports.changeSplitTaskStatus = async (req, res) => {
                  completed_at = $2
              WHERE id = $3
              RETURNING *`,
-            [status, completedAt, split_task_id]
+            [status, completedAt, splitTaskId]
         );
+
+        // Re-derive the parent assignment and task from their children.
+        await syncFromSplitTask(splitTaskId);
 
         return res.status(200).json({
             success: true,
@@ -1669,6 +1918,15 @@ exports.employeeTaskDetails = async (req, res) => {
             });
         }
 
+        const splitTaskId = parseId(split_task_id);
+
+        if (!splitTaskId) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid Split Task ID"
+            });
+        }
+
         const authUser = await getAuthContext(worker_id);
 
         if (!authUser) {
@@ -1722,7 +1980,7 @@ exports.employeeTaskDetails = async (req, res) => {
                AND st.employee_id = $2
                AND cu.company_id  = $3
                AND t.deleted_at IS NULL`,
-            [split_task_id, worker_id, authUser.company_id]
+            [splitTaskId, worker_id, authUser.company_id]
         );
 
         if (result.rows.length === 0) {
@@ -1746,7 +2004,7 @@ exports.employeeTaskDetails = async (req, res) => {
              WHERE split_task_id = $1
                AND submitted_by  = $2
              ORDER BY id DESC`,
-            [split_task_id, worker_id]
+            [splitTaskId, worker_id]
         );
 
         return res.status(200).json({
@@ -1788,6 +2046,15 @@ exports.employeeStartTask = async (req, res) => {
             });
         }
 
+        const splitTaskId = parseId(split_task_id);
+
+        if (!splitTaskId) {
+            return res.status(400).json({
+                success: false,
+                message: "Invalid Split Task ID"
+            });
+        }
+
         const worker_id = req.user.id;
 
         const authUser = await getAuthContext(worker_id);
@@ -1820,7 +2087,7 @@ exports.employeeStartTask = async (req, res) => {
              INNER JOIN customers c
                 ON c.id = t.customer_id
              WHERE st.id = $1`,
-            [split_task_id]
+            [splitTaskId]
         );
 
         if (taskResult.rows.length === 0) {
@@ -1854,8 +2121,11 @@ exports.employeeStartTask = async (req, res) => {
              SET status = $1
              WHERE id = $2
              RETURNING *`,
-            [SPLIT_TASK_STATUS.IN_PROGRESS, split_task_id]
+            [SPLIT_TASK_STATUS.IN_PROGRESS, splitTaskId]
         );
+
+        // Starting the first piece of work moves the parents to In Progress.
+        await syncFromSplitTask(splitTaskId);
 
         return res.status(200).json({
             success: true,

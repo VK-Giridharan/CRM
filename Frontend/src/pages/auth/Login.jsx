@@ -12,7 +12,13 @@ function Login() {
 
     const navigate = useNavigate();
 
-    const handleLogin = async () => {
+    // Accepts the submit event so pressing Enter inside the form works as
+    // well as clicking the button (report BUG-016).
+    const handleLogin = async (event) => {
+        if (event) {
+            event.preventDefault();
+        }
+
         try {
             setLoading(true);
             setError("");
@@ -84,7 +90,7 @@ function Login() {
                     </div>
                 )}
 
-                <div className="space-y-5">
+                <form className="space-y-5" onSubmit={handleLogin}>
 
                     <div>
 
@@ -148,14 +154,14 @@ function Login() {
                     </div>
 
                     <button
-                        onClick={handleLogin}
+                        type="submit"
                         disabled={loading}
                         className="w-full rounded-lg bg-blue-700 py-3 font-semibold text-white transition hover:bg-blue-800 disabled:cursor-not-allowed disabled:bg-blue-400"
                     >
                         {loading ? "Logging In..." : "Login"}
                     </button>
 
-                </div>
+                </form>
 
                 <div className="mt-6 text-center text-sm text-gray-600">
 

@@ -56,6 +56,18 @@ const TASK_STATUS = {
 
 const TASK_STATUSES = Object.values(TASK_STATUS);
 
+// tasks.priority - mirrors the options offered by the Manager Tasks form.
+// The column is a plain varchar with no CHECK constraint, so this list is
+// the only thing stopping a value like "SUPER_URGENT" being persisted.
+const TASK_PRIORITY = {
+    LOW: "Low",
+    MEDIUM: "Medium",
+    HIGH: "High",
+    URGENT: "Urgent"
+};
+
+const TASK_PRIORITIES = Object.values(TASK_PRIORITY);
+
 // users.role - mirrors the user_role PostgreSQL ENUM exactly
 const ROLES = {
     ADMIN: "Admin",
@@ -76,6 +88,8 @@ module.exports = {
     REPORT_STATUS,
     TASK_STATUS,
     TASK_STATUSES,
+    TASK_PRIORITY,
+    TASK_PRIORITIES,
     ROLES,
     WORKER_ROLES
 };

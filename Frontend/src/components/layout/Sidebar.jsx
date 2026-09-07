@@ -50,6 +50,8 @@ function Sidebar() {
 
                         <Link to="/manager/meetings" className="block px-4 py-2 rounded hover:bg-slate-700">Meetings</Link>
 
+                        <Link to="/manager/reports" className="block px-4 py-2 rounded hover:bg-slate-700">Reports</Link>
+
                         <Link to="/manager/profile" className="block px-4 py-2 rounded hover:bg-slate-700">Profile</Link>
                     </>
                 )}

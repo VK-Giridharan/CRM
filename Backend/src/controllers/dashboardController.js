@@ -187,12 +187,18 @@ const managerDashboard = async (companyId) => {
         [companyId]
     );
 
+    // team_size counts the people the Manager actually manages. It used to be
+    // COUNT(*) over the whole company, which included the Manager themselves,
+    // so the "Team Members" card disagreed with the "Team Composition"
+    // breakdown rendered directly underneath it.
     const team = await pool.query(
         `SELECT
             COUNT(*) FILTER (WHERE role = 'Team Lead')  AS team_leads,
             COUNT(*) FILTER (WHERE role = 'Employee')   AS employees,
             COUNT(*) FILTER (WHERE role = 'Intern')     AS interns,
-            COUNT(*)                                    AS total
+            COUNT(*) FILTER (
+                WHERE role IN ('Team Lead', 'Employee', 'Intern')
+            )                                           AS total
          FROM users
          WHERE company_id = $1`,
         [companyId]

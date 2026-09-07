@@ -13,6 +13,8 @@ const {
     WORKER_ROLES
 } = require("../utils/status");
 
+const { syncFromSplitTask } = require("../utils/taskRollup");
+
 // ======================================================
 // COMPANY SCOPING
 //
@@ -273,6 +275,8 @@ exports.submitTaskReport = async (req, res) => {
                 [SPLIT_TASK_STATUS.SUBMITTED, splitTaskId]
             );
 
+            await syncFromSplitTask(splitTaskId, client);
+
             await client.query("COMMIT");
 
             return res.status(201).json({
@@ -403,6 +407,130 @@ exports.teamLeadReportList = async (req, res) => {
 };
 
 // ======================================================
+// MANAGER REPORT LIST
+//
+// The A-Z report found (BUG-014) that a Manager could create a task, assign
+// it and have it worked on, but had no way anywhere in the API to read the
+// reports it produced - every report endpoint was gated to Team Lead. The
+// documented workflow "Manager/Team Leader views Report" was therefore only
+// half implemented.
+//
+// This endpoint is the Manager half. It is company-scoped exactly like every
+// other Manager view: the company comes from the caller's own row, never
+// from the request, so it cannot reach another tenant's reports.
+//
+// The Team Lead endpoint above is untouched, so Team Lead behaviour is
+// unchanged.
+// ======================================================
+
+exports.managerReportList = async (req, res) => {
+
+    try {
+
+        const authUser = await getAuthContext(req.user.id);
+
+        if (!authUser) {
+            return res.status(404).json({
+                success: false,
+                message: "User Not Found"
+            });
+        }
+
+        if (authUser.role !== ROLES.MANAGER) {
+            return res.status(403).json({
+                success: false,
+                message: "Only Manager can view company reports"
+            });
+        }
+
+        if (!authUser.company_id) {
+            return res.status(200).json({
+                success: true,
+                count: 0,
+                data: []
+            });
+        }
+
+        const result = await pool.query(
+            `SELECT
+                tr.id,
+                tr.split_task_id,
+                tr.task_assignment_id,
+                tr.submitted_by,
+                tr.report,
+                tr.review_status,
+                tr.review_remarks,
+                tr.reviewed_by,
+                tr.submitted_at,
+                tr.reviewed_at,
+                tr.attachment_original_name,
+                (tr.attachment_path IS NOT NULL) AS has_attachment,
+
+                st.title       AS split_task_title,
+                st.description AS split_task_description,
+                st.status      AS split_task_status,
+
+                u.first_name || ' ' || COALESCE(u.last_name, '') AS employee_name,
+                u.role AS employee_role,
+
+                tl.first_name || ' ' || COALESCE(tl.last_name, '') AS team_lead_name,
+
+                rv.first_name || ' ' || COALESCE(rv.last_name, '') AS reviewed_by_name,
+
+                ta.task_id,
+                t.title AS parent_task_title,
+                cu.customer_name
+
+             FROM task_reports tr
+
+             INNER JOIN split_tasks st
+                ON st.id = tr.split_task_id
+
+             INNER JOIN task_assignments ta
+                ON ta.id = st.parent_assignment_id
+
+             INNER JOIN tasks t
+                ON t.id = ta.task_id
+
+             INNER JOIN customers cu
+                ON cu.id = t.customer_id
+
+             LEFT JOIN users u
+                ON u.id = tr.submitted_by
+
+             LEFT JOIN users tl
+                ON tl.id = ta.team_lead_id
+
+             LEFT JOIN users rv
+                ON rv.id = tr.reviewed_by
+
+             WHERE cu.company_id = $1
+               AND t.deleted_at IS NULL
+
+             ORDER BY tr.id DESC`,
+            [authUser.company_id]
+        );
+
+        return res.status(200).json({
+            success: true,
+            count: result.rows.length,
+            data: result.rows
+        });
+
+    } catch (error) {
+
+        console.log("MANAGER REPORT LIST ERROR:", error.message);
+
+        return res.status(500).json({
+            success: false,
+            message: "Internal Server Error"
+        });
+
+    }
+
+};
+
+// ======================================================
 // TEAM LEAD - SINGLE REPORT DETAILS
 // ======================================================
 
@@ -430,10 +558,15 @@ exports.getTaskReportDetails = async (req, res) => {
             });
         }
 
-        if (authUser.role !== ROLES.TEAM_LEAD) {
+        // A Manager owns the task the work hangs off, so they may read any
+        // report inside their own company. A Team Lead still only sees the
+        // reports under their own assignments (report BUG-014).
+        const isManager = authUser.role === ROLES.MANAGER;
+
+        if (authUser.role !== ROLES.TEAM_LEAD && !isManager) {
             return res.status(403).json({
                 success: false,
-                message: "Only Team Lead can view report details"
+                message: "Only Manager or Team Lead can view report details"
             });
         }
 
@@ -484,9 +617,9 @@ exports.getTaskReportDetails = async (req, res) => {
                 ON u.id = tr.submitted_by
 
              WHERE tr.id            = $1
-               AND ta.team_lead_id  = $2
-               AND c.company_id     = $3`,
-            [report_id, team_lead_id, authUser.company_id]
+               AND c.company_id     = $2
+               AND ($3::boolean OR ta.team_lead_id = $4)`,
+            [report_id, authUser.company_id, isManager, team_lead_id]
         );
 
         if (result.rows.length === 0) {
@@ -644,6 +777,12 @@ exports.reviewTaskReport = async (req, res) => {
                 [SPLIT_TASK_STATUS.COMPLETED, report.split_task_id]
             );
 
+            // Roll the completion up: when this was the last outstanding
+            // split task the parent assignment and the parent task are
+            // marked Completed too (report BUG-029). Runs inside the same
+            // transaction so it commits atomically with the approval.
+            await syncFromSplitTask(report.split_task_id, client);
+
             await client.query("COMMIT");
 
             return res.status(200).json({
@@ -675,6 +814,9 @@ exports.reviewTaskReport = async (req, res) => {
              WHERE id = $2`,
             [SPLIT_TASK_STATUS.REWORK, report.split_task_id]
         );
+
+        // Sending work back re-opens the parents in the same way.
+        await syncFromSplitTask(report.split_task_id, client);
 
         await client.query("COMMIT");
 

@@ -10,6 +10,7 @@ import {
 } from "../../services/taskService";
 
 import { getWorkers } from "../../services/workerService";
+import { formatDate } from "../../utils/formatDate";
 
 function TeamLeaderTask() {
 
@@ -606,13 +607,13 @@ function TeamLeaderTask() {
 
                                     <td className="px-5 py-4">
 
-                                        {task.start_date || "-"}
+                                        {formatDate(task.start_date)}
 
                                     </td>
 
                                     <td className="px-5 py-4">
 
-                                        {task.due_date || "-"}
+                                        {formatDate(task.due_date)}
 
                                     </td>
 
@@ -757,7 +758,7 @@ function TeamLeaderTask() {
                                         </p>
 
                                         <p className="font-semibold">
-                                            {selectedTask.start_date || "-"}
+                                            {formatDate(selectedTask.start_date)}
                                         </p>
 
                                     </div>
@@ -769,7 +770,7 @@ function TeamLeaderTask() {
                                         </p>
 
                                         <p className="font-semibold">
-                                            {selectedTask.due_date || "-"}
+                                            {formatDate(selectedTask.due_date)}
                                         </p>
 
                                     </div>

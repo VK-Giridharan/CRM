@@ -5,20 +5,11 @@ import { getDashboard } from "../../services/dashboardService";
 
 import StatCard from "../../components/common/StatCard";
 import StatusBreakdown from "../../components/common/StatusBreakdown";
+import { formatDateTime } from "../../utils/formatDate";
 
 // Counts cover only assignments owned by this Team Lead, inside their company.
 
-const formatDateTime = (value) => {
 
-    if (!value) return "-";
-
-    const parsed = new Date(value);
-
-    return Number.isNaN(parsed.getTime())
-        ? "-"
-        : parsed.toLocaleString();
-
-};
 
 function TeamLeaderDashboard() {
 

@@ -81,6 +81,24 @@ export const teamLeadReportList = async () => {
 
 
 // =====================================================
+// MANAGER REPORT LIST
+//
+// Every report produced inside the Manager's own company, across all of
+// their Team Leads. Backend-gated to Manager; company scope comes from the
+// caller's own row.
+// =====================================================
+
+export const managerReportList = async () => {
+
+    const response = await api.get(
+        "/task-report/manager"
+    );
+
+    return response.data;
+};
+
+
+// =====================================================
 // MY REPORTS
 // =====================================================
 

@@ -6,6 +6,7 @@ import ForgotPassword from "../pages/auth/ForgotPassword";
 import ResetPassword from "../pages/auth/ResetPassword";
 
 import ProtectedRoute from "./ProtectedRoute";
+import RedirectHome from "./RedirectHome";
 import DashboardLayout from "../layouts/DashboardLayout";
 
 // Admin
@@ -24,6 +25,7 @@ import ManagerTasks from "../pages/manager/Tasks";
 import ManagerMeetings from "../pages/manager/Meetings";
 import ManagerProfile from "../pages/manager/Profile";
 import ManagerPendingUsers from "../pages/manager/PendingUsers";
+import ManagerReports from "../pages/manager/Reports";
 
 // Team Leader
 import TeamLeaderDashboard from "../pages/teamleader/Dashboard";
@@ -64,7 +66,7 @@ function AppRoutes() {
 
             {/* Public Routes */}
 
-            <Route path="/" element={<Navigate to="/login" replace />} />
+            <Route path="/" element={<RedirectHome />} />
             <Route path="/login" element={<Login />} />
             <Route path="/register" element={<Register />} />
             <Route path="/forgot-password" element={<ForgotPassword />} />
@@ -108,6 +110,7 @@ function AppRoutes() {
                 <Route path="meetings" element={<ManagerMeetings />} />
                 <Route path="profile" element={<ManagerProfile />} />
                 <Route path="pending-users" element={<ManagerPendingUsers />} />
+                <Route path="reports" element={<ManagerReports />} />
             </Route>
 
             {/* ================= TEAM LEADER ================= */}
@@ -163,8 +166,9 @@ function AppRoutes() {
                 <Route path="report" element={<InternReports />} />
             </Route>
 
-            {/* Unknown route */}
-            <Route path="*" element={<Navigate to="/login" replace />} />
+            {/* Unknown route - signed-in users go to their own dashboard,
+                everyone else to login (BUG-020) */}
+            <Route path="*" element={<RedirectHome />} />
 
         </Routes>
     );

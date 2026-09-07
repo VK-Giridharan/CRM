@@ -5,20 +5,11 @@ import { getDashboard } from "../../services/dashboardService";
 
 import StatCard from "../../components/common/StatCard";
 import StatusBreakdown from "../../components/common/StatusBreakdown";
+import { formatDate } from "../../utils/formatDate";
 
 // Every figure is scoped server-side to the manager's own company.
 
-const formatDate = (value) => {
 
-    if (!value) return "-";
-
-    const parsed = new Date(value);
-
-    return Number.isNaN(parsed.getTime())
-        ? "-"
-        : parsed.toLocaleDateString();
-
-};
 
 function ManagerDashboard() {
 

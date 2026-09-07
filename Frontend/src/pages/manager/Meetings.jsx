@@ -18,6 +18,8 @@ import {
     updateLead
 } from "../../services/leadService";
 
+import { formatDate } from "../../utils/formatDate";
+
 function ManagerMeetings() {
 
     // ================= COMMON =================
@@ -37,6 +39,12 @@ function ManagerMeetings() {
     const [leads, setLeads] = useState([]);
 
     const [allLeads, setAllLeads] = useState([]);
+
+    // Which slice of the pipeline the Leads tab is showing.
+    // "Active" keeps the previous default (Pending + Future Business);
+    // "All" and the individual statuses make Converted / Closed /
+    // Meeting Scheduled leads reachable again (BUG-018).
+    const [leadStatusFilter, setLeadStatusFilter] = useState("Active");
 
     const [showLeadModal, setShowLeadModal] = useState(false);
 
@@ -226,13 +234,8 @@ function ManagerMeetings() {
             // Store all leads
             setAllLeads(allData);
 
-            // Leads shown in Lead table
-            const activeLeads = allData.filter((lead) =>
-                lead.status === "Pending" ||
-                lead.status === "Future Business"
-            );
-
-            setLeads(activeLeads);
+            // The Leads tab shows whichever slice the status filter selects.
+            setLeads(allData);
 
         } catch (error) {
 
@@ -455,7 +458,34 @@ function ManagerMeetings() {
 
     // company_name and email are nullable columns, so each value is coerced
     // to a string before matching.
+    const ACTIVE_LEAD_STATUSES = ["Pending", "Future Business"];
+
+    // The backend refuses a meeting for a Converted or Closed lead, so the
+    // Schedule Meeting dropdown must not offer them (BUG-019). The lead
+    // already attached to the meeting being edited is always kept, otherwise
+    // editing an old meeting would blank its own lead.
+    const meetingEligibleLeads = allLeads.filter((lead) =>
+        lead.status !== "Converted" && lead.status !== "Closed"
+            ? true
+            : String(lead.id) === String(meetingForm.lead_id)
+    );
+
+    const matchesLeadStatus = (lead) => {
+
+        if (leadStatusFilter === "All") return true;
+
+        if (leadStatusFilter === "Active") {
+            return ACTIVE_LEAD_STATUSES.includes(lead.status);
+        }
+
+        return lead.status === leadStatusFilter;
+
+    };
+
     const filteredLeads = leads.filter((lead) => {
+
+        if (!matchesLeadStatus(lead)) return false;
+
 
         const value = search.toLowerCase();
 
@@ -555,6 +585,10 @@ function ManagerMeetings() {
 
             getMeetingList();
 
+            // Creating or rescheduling a meeting moves the lead's status on
+            // the server, so refresh the lead list too (BUG-017).
+            getLeadList();
+
         } catch (error) {
 
             console.log(error);
@@ -580,6 +614,9 @@ function ManagerMeetings() {
             setSelectedMeeting(null);
 
             getMeetingList();
+
+            // Deleting the last meeting for a lead resets it to Pending.
+            getLeadList();
 
         } catch (error) {
 
@@ -774,6 +811,45 @@ function ManagerMeetings() {
                         className="w-96 border rounded-lg px-4 py-3 outline-none focus:ring-2 focus:ring-blue-500"
 
                     />
+
+                    {/* Lead status filter (BUG-018): Converted / Closed /
+                        Meeting Scheduled leads used to disappear from the UI
+                        permanently with no way to get back to them. */}
+                    {activeTab === "lead" && (
+
+                        <select
+
+                            value={leadStatusFilter}
+
+                            onChange={(e) => {
+
+                                setLeadStatusFilter(e.target.value);
+
+                                setCurrentPage(1);
+
+                            }}
+
+                            className="border rounded-lg px-4 py-3 outline-none focus:ring-2 focus:ring-blue-500"
+
+                        >
+
+                            <option value="Active">Active Pipeline</option>
+
+                            <option value="All">All Leads</option>
+
+                            <option value="Pending">Pending</option>
+
+                            <option value="Meeting Scheduled">Meeting Scheduled</option>
+
+                            <option value="Future Business">Future Business</option>
+
+                            <option value="Converted">Converted</option>
+
+                            <option value="Closed">Closed</option>
+
+                        </select>
+
+                    )}
 
                     <div className="flex items-center gap-5">
 
@@ -1130,7 +1206,7 @@ function ManagerMeetings() {
                                                 </td>
 
                                                 <td className="px-5 py-3">
-                                                    {meeting.meeting_date}
+                                                    {formatDate(meeting.meeting_date)}
                                                 </td>
 
                                                 <td className="px-5 py-3">
@@ -1860,7 +1936,7 @@ function ManagerMeetings() {
                                     <option value="">Select Lead</option>
 
                                     {
-                                        allLeads.map((lead) => (
+                                        meetingEligibleLeads.map((lead) => (
 
                                             <option
                                                 key={lead.id}
